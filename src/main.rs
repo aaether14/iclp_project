@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 #[derive(Debug, PartialEq)]
 enum Command {
     CreateAccount(String, String),
+    Unparsable(String),
     Exit
 }
 
@@ -22,13 +23,13 @@ enum Message {
 }
 
 impl Command {
-    fn parse(string: &str) -> Option<Command> {
-        match &string.split(|x| x == ' ').collect::<Vec<_>>() as &[&str] {
-            &["CREATE_ACCOUNT", username, password] => Some(Command::CreateAccount(
+    fn parse(data: &str) -> Command {
+        match &data.split(|x| x == ' ').collect::<Vec<_>>() as &[&str] {
+            &["CREATE_ACCOUNT", username, password] => Command::CreateAccount(
                 username.to_string(),
                 password.to_string()
-            )),
-            _ => None
+            ),
+            _ => Command::Unparsable(data.to_string())
         }
     }
 }
@@ -48,11 +49,10 @@ impl CommandParser {
         else {
             // we look for possible commands searching for '\n' bytes.
             if let Some(last_separator_index) = self.buffer.iter().rposition(|x| *x == '\n' as u8) {
-                // the slices returned by split will not contain '\n'
-                // use filter_map because we tolerate invalid messages
                 result.extend(self.buffer.split(|x| *x == '\n' as u8).
-                    filter_map(|x| std::str::from_utf8(x).ok()).
-                    filter_map(|x| Command::parse(x)));
+                    filter(|x| !x.is_empty()). // sans the last element which is empty
+                    map(|x| std::str::from_utf8(x).unwrap_or("Invalid utf8.")). // will result in Unparsable
+                    map(|x| Command::parse(x)));
                 // remove the parsed section from the buffer
                 self.buffer.drain(0..last_separator_index + 1);
             }
@@ -98,14 +98,14 @@ async fn handle_connection(mut socket: TcpStream, address: SocketAddr,
 
 async fn data_server(mut main_receiver: mpsc::Receiver<(Message, oneshot::Sender<Message>)>) -> anyhow::Result<()> {
     loop {
-        let result;
         let (message, result_sender) = 
         main_receiver.recv().await.context("Error receiving message. Closing.")?;
-        match message {
-            _ => { 
-                result = Message::Error(format!("Unknown message {:?}.", message));
+        let result = match message {
+            Message::Command(command) => match command {
+                _ => Message::Error(format!("Unknown command {:?}", command))
             }
-        }
+            _ => Message::Error(format!("Unknown message {:?}.", message))
+        };
         if let Err(unsent_result) = result_sender.send(result) {
             return Err(anyhow::anyhow!("Could not send result {:?} to client.", unsent_result));
         }
@@ -126,7 +126,9 @@ async fn main() -> anyhow::Result<()> {
         let (socket, address) = listener.accept().await?;
         let main_sender = main_sender.clone();
         tokio::spawn(async move {
-            handle_connection(socket, address, main_sender.clone()).await.unwrap();
+            if let Err(error) = handle_connection(socket, address, main_sender.clone()).await {
+                eprintln!("{}", error);
+            }
         });
     }
 }
