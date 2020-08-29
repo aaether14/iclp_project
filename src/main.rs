@@ -15,6 +15,8 @@ enum Command {
     CreateAccount(String, String),
     Login(String, String),
     Unparsable(String),
+    SendMessage(Vec<String>, String),
+    ReadMessage(usize),
     Logout,
     Exit
 }
@@ -23,6 +25,11 @@ enum Command {
 enum Message {
     Success,
     ForceLogout,
+    MessageView {
+        from: String,
+        content: String
+    },
+    NewMessageInMailbox(usize),
     Error(String),
     ClientClosed(SocketAddr),
     NewClient(SocketAddr, mpsc::Sender<Message>),
@@ -37,6 +44,10 @@ impl Command {
             &["LOGIN", username, password] => 
                 Command::Login(username.to_string(), password.to_string()), 
             &["LOGOUT"] => Command::Logout,
+            &["SEND", ref recipients @ .. , message] => 
+                Command::SendMessage(recipients.iter().map(|x| x.to_string()).collect(), message.to_string()),
+            &["READ_MSG", id] => id.parse().map_or(Command::Unparsable(data.to_string()), 
+                |x| Command::ReadMessage(x)),
             _ => Command::Unparsable(data.to_string())
         }
     }
@@ -143,7 +154,8 @@ async fn handle_connection(mut socket: TcpStream, address: SocketAddr,
 
 struct Account {
     password: String,
-    client_address: Option<SocketAddr> // if present, a client is logged into this account
+    messages: Vec<(String, String)>, // (sender, message)
+    logged_address: Option<SocketAddr> // if present, a client is logged into this account
 }
 
 struct AccountsManager {
@@ -152,12 +164,14 @@ struct AccountsManager {
 }
 
 impl AccountsManager {
+
     fn create_account(&mut self, username: String, password: String) -> Message {
         match self.accounts.entry(username.clone()) {
             Entry::Vacant(entry) => {
                 entry.insert(Account {
                     password,
-                    client_address: None
+                    messages: Vec::new(),
+                    logged_address: None
                 });
                 println!("The user '{}' was created.", username);
                 Message::Success
@@ -167,20 +181,23 @@ impl AccountsManager {
             }
         }
     }
+
     fn logged_account(&mut self, address: SocketAddr) -> Option<(&String, &mut Account)> {
-        self.accounts.iter_mut().find(|x| x.1.client_address.as_ref().
+        self.accounts.iter_mut().find(|x| x.1.logged_address.as_ref().
             map_or(false, |y| y == &address))
     }
+
     fn logout(&mut self, address: SocketAddr) -> Message {
         if let Some(account) = self.logged_account(address) {
             println!("Client {} logged out of '{}'.", address, account.0);
-            account.1.client_address = None;
+            account.1.logged_address = None;
             Message::Success
         }
         else {
             Message::Error(format!("Client {} is not logged in.", address))
         }
     }
+
     async fn login(&mut self, username: String, password: String, address: SocketAddr) -> anyhow::Result<Message> {
         if let Some(account) = self.logged_account(address) {
             return Ok(Message::Error(format!("The client {} is already logged into '{}'.", address, account.0)))
@@ -193,10 +210,10 @@ impl AccountsManager {
                 if account.key() == &username && account.get().password == password {
                     // if we already have a client connected we log it out and notify it
                     // replacing the address means that the new client is considered to be logged in
-                    if let Some(old_address) = account.get_mut().client_address.replace(address) {
+                    if let Some(old_address) = account.get_mut().logged_address.replace(address) {
                         println!("{} was logged out of '{}', logging {} in.", old_address, username, address);
                         self.notifiers.get_mut(&old_address).
-                            context(format!("No notifier for client {}.", address))?.
+                            context(format!("No notifier for client {}.", old_address))?.
                             send(Message::ForceLogout).await?;
                     }
                     println!("Client {} logged into '{}'.", address, username);
@@ -206,6 +223,48 @@ impl AccountsManager {
                     Ok(Message::Error("Invalid username or password.".to_string()))
                 }
             }
+        }
+    }
+
+    async fn send(&mut self, recipients: Vec<String>, message: String, address: SocketAddr) -> anyhow::Result<Message> {
+        if let Some(account) = self.logged_account(address) {
+            let username = account.0.clone();
+            // make sure all recipients are valid
+            for r in &recipients {
+                if !self.accounts.keys().any(|x| x == r) {
+                    return Ok(Message::Error(format!("Recipient '{}' is not a valid account.", r)))
+                }
+            }
+            for r in &recipients {
+                let recipient_account = self.accounts.get_mut(r).context("Unreachable.")?;
+                recipient_account.messages.push((username.clone(), message.clone()));
+                if let Some(logged_address) = recipient_account.logged_address {
+                    self.notifiers.get_mut(&logged_address).
+                        context(format!("No notifier for client {}.", logged_address))?.
+                        send(Message::NewMessageInMailbox(recipient_account.messages.len() - 1)).await?;
+                }
+            }
+            Ok(Message::Success)
+        }
+        else {
+            Ok(Message::Error(format!("The client {} is not logged in.", address)))
+        }
+    }
+
+    fn read_message(&mut self, id: usize, address: SocketAddr) -> Message {
+        if let Some(account) = self.logged_account(address) {
+            if let Some(message) = account.1.messages.get(id) {
+                Message::MessageView {
+                    from: message.0.clone(),
+                    content: message.1.clone()
+                }
+            }
+            else {
+                Message::Error(format!("The user '{}' has no message with id {}.", account.0, id))
+            }
+        }
+        else {
+            Message::Error(format!("The client {} is not logged in.", address))
         }
     }
 }
@@ -225,6 +284,9 @@ async fn data_server(mut main_receiver: mpsc::Receiver<(Message, oneshot::Sender
                 Command::Login(username, password) =>
                     accounts_manager.login(username, password, address).await?,
                 Command::Logout => accounts_manager.logout(address),
+                Command::SendMessage(recipients, message) => 
+                    accounts_manager.send(recipients, message, address).await?,
+                Command::ReadMessage(id) => accounts_manager.read_message(id, address),
                 _ => Message::Error(format!("Unknown command {:?}", command))
             }
             // every client will send a notifier upon connecting. 
