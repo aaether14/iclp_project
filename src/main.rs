@@ -7,10 +7,13 @@ use tokio::prelude::*;
 use anyhow::Context;
 
 use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 enum Command {
     CreateAccount(String, String),
+    Login(String, String),
     Unparsable(String),
     Exit
 }
@@ -18,17 +21,20 @@ enum Command {
 #[derive(Debug)]
 enum Message {
     Success,
+    ForceLogout,
     Error(String),
-    Command(Command)
+    ClientClosed(SocketAddr),
+    NewClient(SocketAddr, mpsc::Sender<Message>),
+    Command(SocketAddr, Command)
 }
 
 impl Command {
     fn parse(data: &str) -> Command {
         match &data.split(|x| x == ' ').collect::<Vec<_>>() as &[&str] {
-            &["CREATE_ACCOUNT", username, password] => Command::CreateAccount(
-                username.to_string(),
-                password.to_string()
-            ),
+            &["CREATE_ACCOUNT", username, password] => 
+                Command::CreateAccount(username.to_string(), password.to_string()),
+            &["LOGIN", username, password] => 
+            Command::Login(username.to_string(), password.to_string()), // the notifier will be supplied later 
             _ => Command::Unparsable(data.to_string())
         }
     }
@@ -70,39 +76,155 @@ async fn send_message(main_sender: &mut mpsc::Sender<(Message, oneshot::Sender<M
     Ok(result)
 }
 
-// the main_sender will be used to send messages to the data server
-// we also send a oneshot::Receiver in order to receive results
-async fn handle_connection(mut socket: TcpStream, address: SocketAddr, 
-    mut main_sender: mpsc::Sender<(Message, oneshot::Sender<Message>)>) -> anyhow::Result<()> {
-    println!("Client {:?} connected.", address);
+async fn handle_commands(socket: &mut TcpStream, address: SocketAddr, 
+    main_sender: &mut mpsc::Sender<(Message, oneshot::Sender<Message>)>,
+    notify_receiver: &mut mpsc::Receiver<Message>) -> anyhow::Result<()> {
     let mut command_parser = CommandParser {
         buffer: Vec::new()
     };
     loop {
-        for command in command_parser.read_and_parse(&mut socket).await? {
-            // return if no longer connected to the client
-            if command == Command::Exit {
-                println!("Client {:?} disconnected.", address);
-                return Ok(());
+        // race the two features in a loop so as to run them concurrently
+        tokio::select! {
+            commands = command_parser.read_and_parse(socket) => {
+                for command in commands? {
+                    // return if no longer connected to the client
+                    if let Command::Exit = command {
+                        return Ok(());
+                    }
+                    else {
+                        // send the result back to the client
+                        let result = send_message(main_sender, Message::Command(address, command)).await?;
+                        socket.write_all(format!("{:?}", result).as_bytes()).await?;
+                    }
+                }
+            },
+            notification = notify_receiver.recv() => {
+                socket.write_all(format!("{:?}", 
+                    notification.context("Could not receive notification.")?).as_bytes()).await?;
             }
-            else {
-                // forward the command to the data server
-                // send_message can only fail if the message sending architecture fails
-                // ordinary errors are sent back to the user
-                let result = send_message(&mut main_sender, Message::Command(command)).await?;
-                socket.write_all(format!("{:?}", result).as_bytes()).await?;
+        }
+    }
+}
+
+async fn send_client_closed(main_sender: &mut mpsc::Sender<(Message, oneshot::Sender<Message>)>,
+    address: SocketAddr) -> anyhow::Result<()> {
+    if let client_closed_result @ Message::Error(_) = 
+    send_message(main_sender, Message::ClientClosed(address)).await? {
+        eprintln!("{:?}", client_closed_result);
+    }
+    Ok(())
+}
+
+// the main_sender will be used to send messages to the data server
+// we also send a oneshot::Receiver in order to receive results
+async fn handle_connection(mut socket: TcpStream, address: SocketAddr, 
+    mut main_sender: mpsc::Sender<(Message, oneshot::Sender<Message>)>) -> anyhow::Result<()> {
+    println!("Client {} connected.", address);
+    let (notify_sender, mut notify_receiver) = mpsc::channel(10);
+    // send any error we encouter back to the client and exit gracefully 
+    if let new_client_result @ Message::Error(_) = 
+        send_message(&mut main_sender, Message::NewClient(address, notify_sender)).await? {
+            socket.write_all(format!("{:?}", new_client_result).as_bytes()).await?;
+            println!("Client {} disconnected.", address);
+            return Ok(())
+    }
+    // we can't allow the error to propagate yet because we need to send the ClientClosed message to the data server
+    if let error @ Err(_) = handle_commands(&mut socket, address, 
+        &mut main_sender, &mut notify_receiver).await {
+        send_client_closed(&mut main_sender, address).await?;
+        return error;
+    }
+    send_client_closed(&mut main_sender, address).await?;
+    println!("Client {} disconnected.", address);
+    Ok(())
+}
+
+struct Account {
+    password: String,
+    client_address: Option<SocketAddr> // if present, a client is logged into this account
+}
+
+struct AccountsManager {
+    accounts: HashMap<String, Account>,
+    notifiers: HashMap<SocketAddr, mpsc::Sender<Message>>
+}
+
+impl AccountsManager {
+    fn create_account(&mut self, username: String, password: String) -> Message {
+        match self.accounts.entry(username.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(Account {
+                    password,
+                    client_address: None
+                });
+                println!("The user '{}' was created.", username);
+                Message::Success
+            }
+            Entry::Occupied(account) => {
+                Message::Error(format!("An account with the username '{}' already exists.", account.key()))
+            }
+        }
+    }
+    fn logged_account(&self, address: SocketAddr) -> Option<(&String, &Account)> {
+        self.accounts.iter().find(|x| x.1.client_address.as_ref().
+            map_or(false, |y| y == &address))
+    }
+    async fn login(&mut self, username: String, password: String, address: SocketAddr) -> anyhow::Result<Message> {
+        if let Some(account) = self.logged_account(address) {
+            return Ok(Message::Error(format!("The client {} is already logged into '{}'.", address, account.0)))
+        }
+        match self.accounts.entry(username.clone()) {
+            Entry::Vacant(_) => {
+                Ok(Message::Error("Invalid username or password.".to_string()))
+            }
+            Entry::Occupied(mut account) => {
+                if account.key() == &username && account.get().password == password {
+                    // if we already have a client connected we log it out and notify it
+                    // replacing the address means that the new client is considered to be logged in
+                    if let Some(old_address) = account.get_mut().client_address.replace(address) {
+                        println!("{} was logged out of '{}', logging {} in.", old_address, username, address);
+                        self.notifiers.get_mut(&old_address).
+                            context(format!("No notifier for client {}.", address))?.
+                            send(Message::ForceLogout).await?;
+                    }
+                    println!("Client {} logged into '{}'.", address, username);
+                    Ok(Message::Success)
+                }
+                else {
+                    Ok(Message::Error("Invalid username or password.".to_string()))
+                }
             }
         }
     }
 }
 
 async fn data_server(mut main_receiver: mpsc::Receiver<(Message, oneshot::Sender<Message>)>) -> anyhow::Result<()> {
+    let mut accounts_manager = AccountsManager {
+        accounts: HashMap::new(),
+        notifiers: HashMap::new()
+    };
     loop {
         let (message, result_sender) = 
-        main_receiver.recv().await.context("Error receiving message. Closing.")?;
+            main_receiver.recv().await.context("Error receiving message. Closing.")?;
         let result = match message {
-            Message::Command(command) => match command {
+            Message::Command(address, command) => match command {
+                Command::CreateAccount(username, password) => 
+                    accounts_manager.create_account(username, password),
+                Command::Login(username, password) =>
+                    accounts_manager.login(username, password, address).await?,
                 _ => Message::Error(format!("Unknown command {:?}", command))
+            }
+            // every client will send a notifier upon connecting. 
+            Message::NewClient(address, notify_sender) => {
+                println!("New client {}.", address);
+                accounts_manager.notifiers.insert(address, notify_sender);
+                Message::Success
+            }
+            // remove the notifier upon disconnection
+            Message::ClientClosed(address) => {
+                println!("Client closed {}.", address);
+                accounts_manager.notifiers.remove(&address);
+                Message::Success
             }
             _ => Message::Error(format!("Unknown message {:?}.", message))
         };
@@ -126,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
         let (socket, address) = listener.accept().await?;
         let main_sender = main_sender.clone();
         tokio::spawn(async move {
+            // catch any error here so as not to panic the thread running the task
             if let Err(error) = handle_connection(socket, address, main_sender.clone()).await {
                 eprintln!("{}", error);
             }
