@@ -15,6 +15,7 @@ enum Command {
     CreateAccount(String, String),
     Login(String, String),
     Unparsable(String),
+    Logout,
     Exit
 }
 
@@ -34,7 +35,8 @@ impl Command {
             &["CREATE_ACCOUNT", username, password] => 
                 Command::CreateAccount(username.to_string(), password.to_string()),
             &["LOGIN", username, password] => 
-            Command::Login(username.to_string(), password.to_string()), // the notifier will be supplied later 
+                Command::Login(username.to_string(), password.to_string()), 
+            &["LOGOUT"] => Command::Logout,
             _ => Command::Unparsable(data.to_string())
         }
     }
@@ -109,7 +111,7 @@ async fn handle_commands(socket: &mut TcpStream, address: SocketAddr,
 async fn send_client_closed(main_sender: &mut mpsc::Sender<(Message, oneshot::Sender<Message>)>,
     address: SocketAddr) -> anyhow::Result<()> {
     if let client_closed_result @ Message::Error(_) = 
-    send_message(main_sender, Message::ClientClosed(address)).await? {
+        send_message(main_sender, Message::ClientClosed(address)).await? {
         eprintln!("{:?}", client_closed_result);
     }
     Ok(())
@@ -165,9 +167,19 @@ impl AccountsManager {
             }
         }
     }
-    fn logged_account(&self, address: SocketAddr) -> Option<(&String, &Account)> {
-        self.accounts.iter().find(|x| x.1.client_address.as_ref().
+    fn logged_account(&mut self, address: SocketAddr) -> Option<(&String, &mut Account)> {
+        self.accounts.iter_mut().find(|x| x.1.client_address.as_ref().
             map_or(false, |y| y == &address))
+    }
+    fn logout(&mut self, address: SocketAddr) -> Message {
+        if let Some(account) = self.logged_account(address) {
+            println!("Client {} logged out of '{}'.", address, account.0);
+            account.1.client_address = None;
+            Message::Success
+        }
+        else {
+            Message::Error(format!("Client {} is not logged in.", address))
+        }
     }
     async fn login(&mut self, username: String, password: String, address: SocketAddr) -> anyhow::Result<Message> {
         if let Some(account) = self.logged_account(address) {
@@ -212,6 +224,7 @@ async fn data_server(mut main_receiver: mpsc::Receiver<(Message, oneshot::Sender
                     accounts_manager.create_account(username, password),
                 Command::Login(username, password) =>
                     accounts_manager.login(username, password, address).await?,
+                Command::Logout => accounts_manager.logout(address),
                 _ => Message::Error(format!("Unknown command {:?}", command))
             }
             // every client will send a notifier upon connecting. 
@@ -224,6 +237,7 @@ async fn data_server(mut main_receiver: mpsc::Receiver<(Message, oneshot::Sender
             Message::ClientClosed(address) => {
                 println!("Client closed {}.", address);
                 accounts_manager.notifiers.remove(&address);
+                accounts_manager.logout(address);
                 Message::Success
             }
             _ => Message::Error(format!("Unknown message {:?}.", message))
