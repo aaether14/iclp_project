@@ -1,5 +1,6 @@
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::net::tcp::ReadHalf;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::prelude::*;
@@ -58,8 +59,8 @@ struct CommandParser {
 }
 
 impl CommandParser {
-    async fn read_and_parse(&mut self, socket: &mut TcpStream) -> anyhow::Result<Vec<Command>> {
-        let read = socket.read_buf(&mut self.buffer).await?;
+    async fn read_and_parse<'a>(&mut self, socket_reader: &mut ReadHalf<'a>) -> anyhow::Result<Vec<Command>> {
+        let read = socket_reader.read_buf(&mut self.buffer).await?;
         let mut result = Vec::new();
         if read == 0 {
             // nothing was read, just issue the exit command
@@ -80,74 +81,76 @@ impl CommandParser {
     }
 }
 
-async fn send_message(main_sender: &mut mpsc::Sender<(Message, oneshot::Sender<Message>)>, 
+async fn send_message(sender: &mut mpsc::Sender<(Message, oneshot::Sender<Message>)>, 
     message: Message) -> anyhow::Result<Message> {
     let (result_sender, result_receiver) = oneshot::channel();
-    // only issue an error if the message architecture is malfunctioning 
-    main_sender.send((message, result_sender)).await?;
+    sender.send((message, result_sender)).await?;
     let result = result_receiver.await?;
     Ok(result)
 }
 
-async fn handle_commands(socket: &mut TcpStream, address: SocketAddr, 
-    main_sender: &mut mpsc::Sender<(Message, oneshot::Sender<Message>)>,
-    notify_receiver: &mut mpsc::Receiver<Message>) -> anyhow::Result<()> {
+async fn handle_commands_and_notifications(socket: &mut TcpStream, address: SocketAddr, 
+    data_server_sender: &mut mpsc::Sender<(Message, oneshot::Sender<Message>)>,
+    mut notify_sender: mpsc::Sender<Message>, mut notify_receiver: mpsc::Receiver<Message>) -> anyhow::Result<()> {
     let mut command_parser = CommandParser {
         buffer: Vec::new()
     };
-    loop {
-        // race the two features in a loop so as to run them concurrently
-        tokio::select! {
-            commands = command_parser.read_and_parse(socket) => {
-                for command in commands? {
-                    // return if no longer connected to the client
+    let (mut socket_reader, mut socket_writer) = socket.split();
+    // we run two loops concurrently, one processing input from the client
+    // the other one processing notifications (which can also come from processing commands) and 
+    // sending results back to the client
+    tokio::select! {
+        r1 = async {
+            loop {
+                for command in command_parser.read_and_parse(&mut socket_reader).await? {
                     if let Command::Exit = command {
-                        return Ok(());
+                        return Ok::<(), anyhow::Error>(())
                     }
-                    else {
-                        // send the result back to the client
-                        let result = send_message(main_sender, Message::Command(address, command)).await?;
-                        socket.write_all(format!("{:?}", result).as_bytes()).await?;
-                    }
+                    let result = send_message(data_server_sender, Message::Command(address, command)).await?;
+                    // notifications are just messages that we intend to send back to the client
+                    notify_sender.send(result).await?;
                 }
-            },
-            notification = notify_receiver.recv() => {
-                socket.write_all(format!("{:?}", 
-                    notification.context("Could not receive notification.")?).as_bytes()).await?;
             }
-        }
+        } => r1?,
+        r2 = async {
+            loop {
+                let notification = notify_receiver.recv().await.context("Cound not receive notification.")?;
+                socket_writer.write_all(format!("{:?}", notification).as_bytes()).await?;
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), anyhow::Error>(())
+        } => r2?
     }
+    Ok(())
 }
 
-async fn send_client_closed(main_sender: &mut mpsc::Sender<(Message, oneshot::Sender<Message>)>,
+async fn send_client_closed(data_server_sender: &mut mpsc::Sender<(Message, oneshot::Sender<Message>)>,
     address: SocketAddr) -> anyhow::Result<()> {
     if let client_closed_result @ Message::Error(_) = 
-        send_message(main_sender, Message::ClientClosed(address)).await? {
+        send_message(data_server_sender, Message::ClientClosed(address)).await? {
         eprintln!("{:?}", client_closed_result);
     }
     Ok(())
 }
 
-// the main_sender will be used to send messages to the data server
-// we also send a oneshot::Receiver in order to receive results
 async fn handle_connection(mut socket: TcpStream, address: SocketAddr, 
-    mut main_sender: mpsc::Sender<(Message, oneshot::Sender<Message>)>) -> anyhow::Result<()> {
+    mut data_server_sender: mpsc::Sender<(Message, oneshot::Sender<Message>)>) -> anyhow::Result<()> {
     println!("Client {} connected.", address);
-    let (notify_sender, mut notify_receiver) = mpsc::channel(10);
+    let (notify_sender, notify_receiver) = mpsc::channel(10);
     // send any error we encouter back to the client and exit gracefully 
     if let new_client_result @ Message::Error(_) = 
-        send_message(&mut main_sender, Message::NewClient(address, notify_sender)).await? {
+        send_message(&mut data_server_sender, Message::NewClient(address, notify_sender.clone())).await? {
             socket.write_all(format!("{:?}", new_client_result).as_bytes()).await?;
             println!("Client {} disconnected.", address);
             return Ok(())
     }
     // we can't allow the error to propagate yet because we need to send the ClientClosed message to the data server
-    if let error @ Err(_) = handle_commands(&mut socket, address, 
-        &mut main_sender, &mut notify_receiver).await {
-        send_client_closed(&mut main_sender, address).await?;
+    if let error @ Err(_) = handle_commands_and_notifications(&mut socket, address, 
+        &mut data_server_sender, notify_sender, notify_receiver).await {
+        send_client_closed(&mut data_server_sender, address).await?;
         return error;
     }
-    send_client_closed(&mut main_sender, address).await?;
+    send_client_closed(&mut data_server_sender, address).await?;
     println!("Client {} disconnected.", address);
     Ok(())
 }
@@ -269,14 +272,14 @@ impl AccountsManager {
     }
 }
 
-async fn data_server(mut main_receiver: mpsc::Receiver<(Message, oneshot::Sender<Message>)>) -> anyhow::Result<()> {
+async fn data_server(mut data_server_receiver: mpsc::Receiver<(Message, oneshot::Sender<Message>)>) -> anyhow::Result<()> {
     let mut accounts_manager = AccountsManager {
         accounts: HashMap::new(),
         notifiers: HashMap::new()
     };
     loop {
         let (message, result_sender) = 
-            main_receiver.recv().await.context("Error receiving message. Closing.")?;
+            data_server_receiver.recv().await.context("Error receiving message. Closing.")?;
         let result = match message {
             Message::Command(address, command) => match command {
                 Command::CreateAccount(username, password) => 
@@ -315,17 +318,17 @@ async fn data_server(mut main_receiver: mpsc::Receiver<(Message, oneshot::Sender
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut listener = TcpListener::bind("127.0.0.1:8080").await?;
-    let (main_sender, main_receiver) = 
+    let (data_server_sender, data_server_receiver) = 
         mpsc::channel(100);
     tokio::spawn(async move {
-        data_server(main_receiver).await.unwrap();
+        data_server(data_server_receiver).await.unwrap();
     });
     loop {
         let (socket, address) = listener.accept().await?;
-        let main_sender = main_sender.clone();
+        let data_server_sender = data_server_sender.clone();
         tokio::spawn(async move {
             // catch any error here so as not to panic the thread running the task
-            if let Err(error) = handle_connection(socket, address, main_sender.clone()).await {
+            if let Err(error) = handle_connection(socket, address, data_server_sender).await {
                 eprintln!("{}", error);
             }
         });
