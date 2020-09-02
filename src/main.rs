@@ -1,6 +1,7 @@
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::net::tcp::ReadHalf;
+use tokio::net::tcp::WriteHalf;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::prelude::*;
@@ -39,7 +40,7 @@ enum Message {
 
 impl Command {
     fn parse(data: &str) -> Command {
-        match &data.split(|x| x == ' ').collect::<Vec<_>>() as &[&str] {
+        match data.split(|x| x == ' ').collect::<Vec<_>>().as_slice() {
             &["CREATE_ACCOUNT", username, password] => 
                 Command::CreateAccount(username.to_string(), password.to_string()),
             &["LOGIN", username, password] => 
@@ -89,6 +90,13 @@ async fn send_message(sender: &mut mpsc::Sender<(Message, oneshot::Sender<Messag
     Ok(result)
 }
 
+async fn write_to_socket<'a>(socket_writer: &mut WriteHalf<'a>, data: &str) -> anyhow::Result<()> {
+    let bytes = data.as_bytes();
+    socket_writer.write_all(&bytes.len().to_be_bytes()).await?;
+    socket_writer.write_all(bytes).await?;
+    Ok(())
+}
+
 async fn handle_commands_and_notifications(socket: &mut TcpStream, address: SocketAddr, 
     data_server_sender: &mut mpsc::Sender<(Message, oneshot::Sender<Message>)>,
     mut notify_sender: mpsc::Sender<Message>, mut notify_receiver: mpsc::Receiver<Message>) -> anyhow::Result<()> {
@@ -115,7 +123,7 @@ async fn handle_commands_and_notifications(socket: &mut TcpStream, address: Sock
         r2 = async {
             loop {
                 let notification = notify_receiver.recv().await.context("Cound not receive notification.")?;
-                socket_writer.write_all(format!("{:?}", notification).as_bytes()).await?;
+                write_to_socket(&mut socket_writer, &format!("{:?}", notification)).await?;
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
@@ -140,7 +148,8 @@ async fn handle_connection(mut socket: TcpStream, address: SocketAddr,
     // send any error we encouter back to the client and exit gracefully 
     if let new_client_result @ Message::Error(_) = 
         send_message(&mut data_server_sender, Message::NewClient(address, notify_sender.clone())).await? {
-            socket.write_all(format!("{:?}", new_client_result).as_bytes()).await?;
+            let (_, mut socket_writer) = socket.split();
+            write_to_socket(&mut socket_writer, &format!("{:?}", new_client_result)).await?;
             println!("Client {} disconnected.", address);
             return Ok(())
     }
