@@ -6,6 +6,8 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::prelude::*;
 
+use serde_json::json;
+
 use anyhow::Context;
 
 use std::net::SocketAddr;
@@ -23,21 +25,6 @@ enum Command {
     Exit
 }
 
-#[derive(Debug)]
-enum Message {
-    Success,
-    ForceLogout,
-    MessageView {
-        from: String,
-        content: String
-    },
-    NewMessageInMailbox(usize),
-    Error(String),
-    ClientClosed(SocketAddr),
-    NewClient(SocketAddr, mpsc::Sender<Message>),
-    Command(SocketAddr, Command)
-}
-
 impl Command {
     fn parse(data: &str) -> Command {
         match data.split(|x| x == ' ').collect::<Vec<_>>().as_slice() {
@@ -52,6 +39,49 @@ impl Command {
                 |x| Command::ReadMessage(x)),
             _ => Command::Unparsable(data.to_string())
         }
+    }
+}
+
+#[derive(Debug)]
+enum Message {
+    Success,
+    ForceLogout,
+    Message(String, String), // from, content
+    NewMessageInMailbox(usize),
+    Error(String),
+    ClientClosed(SocketAddr),
+    NewClient(SocketAddr, mpsc::Sender<Message>),
+    Command(SocketAddr, Command)
+}
+
+impl Message {
+    fn to_json_string(&self) -> String {
+        let value = match self {
+            Message::Success => json!({
+                "type": "success"
+            }),
+            Message::ForceLogout => json!({
+                "type": "force_logout"
+            }),
+            Message::NewMessageInMailbox(id) => json!({
+                "type": "new_message_in_mail_box",
+                "id": id
+            }),
+            Message::Message(from, content) => json!({
+                "type": "message",
+                "from": from,
+                "content": content
+            }),
+            Message::Error(content) => json!({
+                "type": "error",
+                "content": content
+            }),
+            rest => json!({
+                "type": "unserializable", 
+                "content": format!("{:?}", rest)
+            })
+        };
+        value.to_string()
     }
 }
 
@@ -123,7 +153,7 @@ async fn handle_commands_and_notifications(socket: &mut TcpStream, address: Sock
         r2 = async {
             loop {
                 let notification = notify_receiver.recv().await.context("Cound not receive notification.")?;
-                write_to_socket(&mut socket_writer, &format!("{:?}", notification)).await?;
+                write_to_socket(&mut socket_writer, &notification.to_json_string()).await?;
             }
             #[allow(unreachable_code)]
             Ok::<(), anyhow::Error>(())
@@ -149,7 +179,7 @@ async fn handle_connection(mut socket: TcpStream, address: SocketAddr,
     if let new_client_result @ Message::Error(_) = 
         send_message(&mut data_server_sender, Message::NewClient(address, notify_sender.clone())).await? {
             let (_, mut socket_writer) = socket.split();
-            write_to_socket(&mut socket_writer, &format!("{:?}", new_client_result)).await?;
+            write_to_socket(&mut socket_writer, &new_client_result.to_json_string()).await?;
             println!("Client {} disconnected.", address);
             return Ok(())
     }
@@ -266,10 +296,7 @@ impl AccountsManager {
     fn read_message(&mut self, id: usize, address: SocketAddr) -> Message {
         if let Some(account) = self.logged_account(address) {
             if let Some(message) = account.1.messages.get(id) {
-                Message::MessageView {
-                    from: message.0.clone(),
-                    content: message.1.clone()
-                }
+                Message::Message(message.0.clone(), message.1.clone())
             }
             else {
                 Message::Error(format!("The user '{}' has no message with id {}.", account.0, id))
