@@ -21,13 +21,14 @@ enum Command {
     Unparsable(String),
     SendMessage(Vec<String>, String),
     ReadMessage(usize),
+    ReadMailbox,
     Logout,
     Exit
 }
 
 impl Command {
     fn parse(data: &str) -> Command {
-        match data.split(|x| x == ' ').collect::<Vec<_>>().as_slice() {
+        match data.trim().split(|x| x == ' ').collect::<Vec<_>>().as_slice() {
             &["CREATE_ACCOUNT", username, password] => 
                 Command::CreateAccount(username.to_string(), password.to_string()),
             &["LOGIN", username, password] => 
@@ -37,6 +38,7 @@ impl Command {
                 Command::SendMessage(recipients.iter().map(|x| x.to_string()).collect(), message.to_string()),
             &["READ_MSG", id] => id.parse().map_or(Command::Unparsable(data.to_string()), 
                 |x| Command::ReadMessage(x)),
+            &["READ_MAILBOX"] => Command::ReadMailbox,
             _ => Command::Unparsable(data.to_string())
         }
     }
@@ -47,6 +49,7 @@ enum Message {
     Success,
     ForceLogout,
     Message(String, String), // from, content
+    Mailbox(Vec<usize>),
     NewMessageInMailbox(usize),
     Error(String),
     ClientClosed(SocketAddr),
@@ -71,6 +74,10 @@ impl Message {
                 "type": "message",
                 "from": from,
                 "content": content
+            }),
+            Message::Mailbox(ids) => json!({
+                "type": "mailbox",
+                "ids": ids
             }),
             Message::Error(content) => json!({
                 "type": "error",
@@ -306,6 +313,16 @@ impl AccountsManager {
             Message::Error(format!("The client {} is not logged in.", address))
         }
     }
+
+    fn read_mailbox(&mut self, address: SocketAddr) -> Message {
+        if let Some(account) = self.logged_account(address) {
+            // if n messages then 0 -> n-1 indices will be collected
+            Message::Mailbox((0..account.1.messages.len()).collect())
+        }
+        else {
+            Message::Error(format!("The client {} is not logged in.", address))
+        }
+    }
 }
 
 async fn data_server(mut data_server_receiver: mpsc::Receiver<(Message, oneshot::Sender<Message>)>) -> anyhow::Result<()> {
@@ -326,6 +343,7 @@ async fn data_server(mut data_server_receiver: mpsc::Receiver<(Message, oneshot:
                 Command::SendMessage(recipients, message) => 
                     accounts_manager.send(recipients, message, address).await?,
                 Command::ReadMessage(id) => accounts_manager.read_message(id, address),
+                Command::ReadMailbox => accounts_manager.read_mailbox(address),
                 _ => Message::Error(format!("Unknown command {:?}", command))
             }
             // every client will send a notifier upon connecting. 
